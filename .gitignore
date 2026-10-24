@@ -221,3 +221,4 @@ __marimo__/
 __pycache__/
 *.pyc
 .image-urls.json
+.image-cache/

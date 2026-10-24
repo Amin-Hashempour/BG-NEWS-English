@@ -7,6 +7,7 @@ import concurrent.futures
 import hashlib
 import json
 import re
+import tempfile
 import threading
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -14,11 +15,15 @@ from html import unescape
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
 IMAGE_CACHE_FILE = ROOT / ".image-urls.json"
+IMAGE_FILES = ROOT / ".image-cache"
+IMAGE_FETCH_LOCKS = [threading.Lock() for _ in range(64)]
+IMAGE_DOWNLOADS = threading.BoundedSemaphore(6)
+IMAGE_ACCEPT = "image/jpeg,image/png,image/webp,image/*;q=0.8"
 MAX_PAGES = 50
 SOURCES = {
     "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query",
@@ -48,6 +53,8 @@ IMAGE_LOCK = threading.Lock()
 
 
 def safe_url(value: str, base: str, *, article: bool = False) -> str:
+    if not value or not value.strip():
+        return ""
     url = urljoin(base, unescape(value or "").strip())
     parts = urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.hostname:
@@ -76,16 +83,57 @@ def request_bytes(url: str, *, accept: str, referer: str = "", limit: int = 8 * 
 
 
 def image_content_type(data: bytes, reported: str) -> str:
-    if reported.startswith("image/"):
-        return reported
     signatures = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"),
-                  (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"), (b"RIFF", "image/webp"))
+                  (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"))
     for signature, content_type in signatures:
         if data.startswith(signature):
             return content_type
     if data[4:12] in (b"ftypavif", b"ftypavis"):
         return "image/avif"
+    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+        return "image/webp"
     return ""
+
+
+def image_from_attrs(attrs: dict, base: str) -> str:
+    # VGC supplies only data-srcset; Gematsu uses both src and data-srcset.
+    srcset = attrs.get("data-srcset") or attrs.get("srcset") or ""
+    candidates = []
+    for part in srcset.split(","):
+        fields = part.strip().split()
+        if fields:
+            width = int(fields[1][:-1]) if len(fields) > 1 and re.fullmatch(r"\d+w", fields[1]) else 0
+            candidates.append((width, fields[0]))
+    if candidates:
+        suitable = sorted(candidate for candidate in candidates if candidate[0] >= 480)
+        return safe_url((suitable[0] if suitable else max(candidates))[1], base)
+    return safe_url(attrs.get("data-src") or attrs.get("data-lazy-src") or
+                    attrs.get("data-original") or attrs.get("src") or "", base)
+
+
+class ArticleImages(HTMLParser):
+    """Prefer the article's Open Graph image over logos and unrelated images."""
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.preferred = []
+        self.other = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "meta" and (attrs.get("property") or attrs.get("name")) in (
+                "og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"):
+            value = safe_url(attrs.get("content", ""), self.base)
+            if value:
+                self.preferred.append(value)
+        elif tag == "img":
+            value = image_from_attrs(attrs, self.base)
+            if value:
+                self.other.append(value)
+
+    @property
+    def urls(self):
+        return list(dict.fromkeys(self.preferred + self.other))
 
 
 class NewsHTMLParser(HTMLParser):
@@ -122,11 +170,8 @@ class NewsHTMLParser(HTMLParser):
             if href and ("next" in rel or "load-more" in classes or "load_more" in classes):
                 self.next_url = href
         elif tag in ("img", "source") and self._article:
-            image = (attrs.get("data-src") or attrs.get("data-lazy-src") or attrs.get("data-original")
-                     or attrs.get("src") or "")
-            if not image and attrs.get("srcset"):
-                image = attrs["srcset"].split(",")[-1].strip().split()[0]
-            self._article_image = self._article_image or safe_url(image, self.base)
+            if tag == "img" or attrs.get("type", "").startswith("image/"):
+                self._article_image = self._article_image or image_from_attrs(attrs, self.base)
         elif tag == "time" and self._article:
             self._article_date = attrs.get("datetime", "") or self._article_date
         elif tag == "link" and "next" in attrs.get("rel", "").lower().split():
@@ -317,24 +362,100 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
 
 
 def add_image_proxies(items: list[dict]) -> list[dict]:
-    changed = False
     for item in items:
-        if item.get("image"):
-            original = item["image"]
-            token = hashlib.sha256(original.encode()).hexdigest()
-            with IMAGE_LOCK:
-                if IMAGE_URLS.get(token) != (original, item["url"]):
-                    IMAGE_URLS[token] = (original, item["url"])
-                    changed = True
-            item["originalImage"] = original
-            item["image"] = "/api/image/" + token
-    if changed:
-        with IMAGE_LOCK:
-            try:
-                IMAGE_CACHE_FILE.write_text(json.dumps(IMAGE_URLS, ensure_ascii=False), "utf-8")
-            except OSError:
-                pass
+        original = item.get("originalImage") or item.get("image", "")
+        item["originalImage"] = original
+        # Each URL carries its own recovery information; no RAM token or JSON
+        # mapping is needed, even for old browser history on a fresh installation.
+        item["image"] = "/api/story-image?" + urlencode({"article": item["url"], "image": original})
     return items
+
+
+def source_for_article(article: str) -> dict:
+    parts = urlsplit(article)
+    if parts.scheme != "https" or parts.username or parts.password or parts.port not in (None, 443):
+        raise ValueError("Invalid article URL")
+    host = (parts.hostname or "").removeprefix("www.")
+    for source in SOURCES.values():
+        if host == urlsplit(source["url"]).hostname.removeprefix("www."):
+            return source
+    raise ValueError("Unknown news source")
+
+
+def allowed_image_url(value: str, article: str) -> str:
+    source = source_for_article(article)
+    url = safe_url(value, article)
+    parts = urlsplit(url)
+    host = (parts.hostname or "").removeprefix("www.")
+    source_host = urlsplit(source["url"]).hostname.removeprefix("www.")
+    allowed_hosts = {source_host}
+    if source_host == "pushsquare.com":
+        allowed_hosts.add("images.pushsquare.com")
+    if source_host == "gamespot.com":
+        allowed_hosts.update(("static.gamespot.com", "www.gamespot.com", "www.giantbomb.com"))
+    if (parts.scheme not in ("http", "https") or parts.username or parts.password or
+            parts.port not in (None, 80, 443) or host not in allowed_hosts):
+        return ""
+    # Reject listing/article pages that older versions accidentally saved as images.
+    if not re.search(r"\.(?:jpe?g|png|webp|gif|avif)(?:$|/)", parts.path, re.I):
+        return ""
+    return url
+
+
+def get_story_image(article: str, hint: str = "") -> tuple[bytes, str]:
+    source_for_article(article)
+    key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
+    cache_file = IMAGE_FILES / (key + ".img")
+    with IMAGE_FETCH_LOCKS[int(key[:2], 16) % len(IMAGE_FETCH_LOCKS)]:
+        try:
+            cached = cache_file.read_bytes()
+            kind = image_content_type(cached, "")
+            if kind:
+                return cached, kind
+        except OSError:
+            pass
+        with IMAGE_DOWNLOADS:
+            tried = set()
+
+            def download(candidate):
+                url = allowed_image_url(candidate, article)
+                if not url or url in tried:
+                    return None
+                tried.add(url)
+                # Prefer no Referer: this avoids sending localhost to hotlink
+                # protection. Some publishers require their own article Referer.
+                for referer in ("", article):
+                    try:
+                        data, reported = request_bytes(url, accept=IMAGE_ACCEPT, referer=referer,
+                                                       timeout=12, limit=10 * 1024 * 1024)
+                        kind = image_content_type(data, reported)
+                        if kind:
+                            return data, kind
+                    except Exception:
+                        continue
+                return None
+
+            result = download(hint)
+            if result is None:
+                data, kind = request_bytes(article, accept="text/html,application/xhtml+xml",
+                                           timeout=15, limit=4 * 1024 * 1024)
+                parser = ArticleImages(article)
+                parser.feed(data.decode("utf-8", errors="replace"))
+                for candidate in parser.urls[:8]:
+                    result = download(candidate)
+                    if result is not None:
+                        break
+            if result is None:
+                raise ValueError("The publisher did not provide a downloadable article image")
+        try:
+            IMAGE_FILES.mkdir(exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=IMAGE_FILES, delete=False) as temporary:
+                temporary.write(result[0])
+                temporary_path = Path(temporary.name)
+            temporary_path.replace(cache_file)
+        except OSError:
+            pass  # A read-only project directory must not prevent image display.
+        return result
 
 
 def parse_request_body(handler) -> dict:
@@ -359,6 +480,33 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def end_headers(self):
+        if urlsplit(self.path).path in ("/", "/index.html", "/app.js", "/styles.css", "/layout-ltr.css"):
+            self.send_header("Cache-Control", "no-store")
+        super().end_headers()
+
+    def serve_story_image(self, article, hint):
+        try:
+            source_for_article(article)
+            if len(article) > 4096 or len(hint) > 4096:
+                raise ValueError("Image request too long")
+        except ValueError:
+            self.send_error(400)
+            return
+        try:
+            data, image_type = get_story_image(article, hint)
+        except Exception as exc:
+            self.log_error("Publisher image failed (%s)", type(exc).__name__)
+            self.send_error(502, "The publisher image is currently unavailable")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", image_type)
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_POST(self):
         if urlsplit(self.path).path != "/api/news":
             self.send_error(404)
@@ -376,7 +524,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self.json_response({"ok": True, "sources": len(SOURCES)})
+            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.0"})
+        elif path == "/api/story-image":
+            query = parse_qs(urlsplit(self.path).query)
+            self.serve_story_image(query.get("article", [""])[0], query.get("image", [""])[0])
         elif path.startswith("/api/image/"):
             token = path.rsplit("/", 1)[-1]
             with IMAGE_LOCK:
@@ -384,25 +535,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not image:
                 self.send_error(404)
                 return
-            try:
-                try:
-                    data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
-                                                   referer=image[1], limit=10 * 1024 * 1024, timeout=15)
-                except Exception:
-                    data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
-                                                   limit=10 * 1024 * 1024, timeout=15)
-                image_type = image_content_type(data, reported)
-                if not image_type:
-                    raise ValueError("Not an image")
-            except Exception:
-                self.send_error(502)
-                return
-            self.send_response(200)
-            self.send_header("Content-Type", image_type)
-            self.send_header("Cache-Control", "private, max-age=3600")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
+            self.serve_story_image(image[1], image[0])
         elif path in ("/", "/index.html", "/favicon.svg", "/fonts.css", "/styles.css", "/layout-ltr.css", "/app.js") or path.startswith("/fonts/"):
             super().do_GET()
         else:
@@ -413,5 +546,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
-    print(f"News reader: http://127.0.0.1:{args.port}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    print(f"Checkpoint 1.3.0: http://127.0.0.1:{args.port}", flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()

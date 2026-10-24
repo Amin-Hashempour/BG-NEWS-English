@@ -13,9 +13,11 @@ function httpURL(value) {
   try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) ? url.href : ''; }
   catch { return ''; }
 }
-function imageURL(value) {
-  if (typeof value === 'string' && /^\/api\/image\/[a-f0-9]{64}$/.test(value)) return value;
-  return httpURL(value);
+function storyImageURL(item) {
+  const article = httpURL(item.url);
+  if (!article) return '';
+  const original = httpURL(item.originalImage) || httpURL(item.image);
+  return '/api/story-image?' + new URLSearchParams({ article, image: original });
 }
 function message(text, error = false) {
   const node = document.createElement('div');
@@ -36,16 +38,23 @@ function render() {
     const mark = document.createElement('span'); mark.className = `source-mark source-${item.source.toLowerCase()}`; mark.textContent = item.source; mark.title = names[item.source];
     const link = document.createElement('a'); link.className = 'story-link'; link.href = item.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
     const imageWrap = document.createElement('div'); imageWrap.className = 'image-wrap';
-    const fallback = () => { imageWrap.replaceChildren(); const symbol = document.createElement('span'); symbol.textContent = item.source; imageWrap.append(symbol); };
-    if (imageURL(item.image)) {
-      const image = document.createElement('img'); image.src = imageURL(item.image); image.alt = ''; image.loading = 'lazy';
-      image.addEventListener('error', () => {
-        const original = imageURL(item.originalImage);
-        if (original && image.src !== original) image.src = original;
-        else fallback();
+    // Reconstruct the local URL from the article, including for legacy history
+    // whose RAM tokens or original image fields are missing or incorrect.
+    const candidates = [...new Set([storyImageURL(item), httpURL(item.originalImage) || httpURL(item.image)].filter(Boolean))];
+    const image = document.createElement('img'); image.alt = ''; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer';
+    let candidate = 0;
+    image.addEventListener('error', () => {
+      candidate++;
+      if (candidate < candidates.length) { image.src = candidates[candidate]; return; }
+      imageWrap.replaceChildren();
+      const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'retry-image'; retry.textContent = 'Retry image';
+      retry.addEventListener('click', event => {
+        event.preventDefault(); event.stopPropagation(); candidate = 0;
+        imageWrap.replaceChildren(image); image.src = candidates[0];
       });
-      imageWrap.append(image);
-    } else fallback();
+      imageWrap.append(retry);
+    });
+    if (candidates.length) { imageWrap.append(image); image.src = candidates[0]; }
     const copy = document.createElement('div'); copy.className = 'story-copy';
     const meta = document.createElement('div'); meta.className = 'card-meta';
     const source = document.createElement('span'); source.textContent = names[item.source];
@@ -108,3 +117,6 @@ document.querySelectorAll('.filter').forEach(button => button.addEventListener('
 $('refresh').addEventListener('click', refresh);
 render();
 if (location.protocol === 'file:') message('Run python3 server.py, then open http://127.0.0.1:8766 in your browser.', true);
+else fetch('/api/health', { cache: 'no-store' }).then(response => response.json()).then(health => {
+  if (health.version !== '1.3.0') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
+}).catch(() => message('The local server is unavailable. Run python3 server.py from this project folder.', true));

@@ -1,5 +1,8 @@
+import base64
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import server
 
@@ -41,14 +44,47 @@ class ParserTests(unittest.TestCase):
     def test_image_signature_fallback(self):
         self.assertEqual(server.image_content_type(b"RIFF1234WEBP", "application/octet-stream"), "image/webp")
 
-    @patch("pathlib.Path.write_text")
-    def test_image_proxy_keeps_direct_fallback_and_stable_mapping(self, write_text):
+    def test_html_mislabeled_as_an_image_is_rejected(self):
+        self.assertEqual(server.image_content_type(b"<html>Blocked</html>", "image/jpeg"), "")
+
+    def test_vgc_lazy_srcset_and_missing_image(self):
+        html = b'''<article><a href="/news/a-story"><img data-srcset="/files/a-320.jpg 320w, /files/a-480.jpg 480w, /files/a.jpg 1920w"><h2>The exact story title here</h2></a></article>'''
+        items, _ = server.parse_news_page(html, "https://www.videogameschronicle.com/category/news/")
+        self.assertEqual(items[0]["image"], "https://www.videogameschronicle.com/files/a-480.jpg")
+        self.assertEqual(server.safe_url("", "https://www.videogameschronicle.com/category/news/"), "")
+
+    def test_image_url_is_self_contained_without_a_saved_mapping(self):
         item = {"id": "story", "url": "https://example.org/story", "title": "Story",
                 "image": "https://cdn.example.org/image.webp", "published": ""}
         server.add_image_proxies([item])
         self.assertEqual(item["originalImage"], "https://cdn.example.org/image.webp")
-        self.assertRegex(item["image"], r"^/api/image/[a-f0-9]{64}$")
-        self.assertIn(item["image"].rsplit("/", 1)[-1], server.IMAGE_URLS)
+        query = server.parse_qs(server.urlsplit(item["image"]).query)
+        self.assertEqual(query["article"], [item["url"]])
+        self.assertEqual(query["image"], [item["originalImage"]])
+
+    @patch("server.request_bytes")
+    def test_wrong_legacy_image_is_recovered_and_cached_across_restarts(self, request):
+        article = "https://www.gematsu.com/2026/10/story"
+        wrong_image = "https://www.gematsu.com/browse"
+        png = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aSncAAAAASUVORK5CYII=")
+        request.side_effect = [
+            (b'<meta property="og:image" content="https://www.gematsu.com/wp-content/uploads/story.jpg">', "text/html"),
+            (png, "application/octet-stream"),
+        ]
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "IMAGE_FILES", Path(directory)):
+            data, kind = server.get_story_image(article, wrong_image)
+            self.assertEqual(data, png)
+            self.assertEqual(kind, "image/png")
+            self.assertEqual(request.call_args_list[0].args[0], article)
+            # A new process has no in-memory mapping; only the cached bytes remain.
+            with patch.dict(server.IMAGE_URLS, {}, clear=True):
+                request.side_effect = AssertionError("Offline: must read the image from disk")
+                self.assertEqual(server.get_story_image(article, wrong_image), (png, "image/png"))
+
+    def test_image_endpoint_rejects_unrelated_hosts(self):
+        with self.assertRaises(ValueError):
+            server.get_story_image("http://127.0.0.1/private", "")
+        self.assertEqual(server.allowed_image_url("https://other.test/image.jpg", "https://www.gematsu.com/story"), "")
 
     @patch("server.request_bytes")
     def test_crawler_follows_pages_until_known_item(self, request):
