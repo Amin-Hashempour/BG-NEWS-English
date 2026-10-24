@@ -1,0 +1,10 @@
+html,body{direction:ltr}
+header,.toolbar,.notice,.empty{text-align:left}
+.story-link{grid-template-columns:190px minmax(0,1fr);grid-template-areas:"image copy";direction:ltr}
+.story-copy{direction:ltr;text-align:left}
+.card-meta{direction:ltr}
+.empty{text-align:center}
+footer{justify-content:flex-start}
+.refresh-wrap{right:auto;left:34px;flex-direction:row}
+@media(max-width:760px){.story-link{grid-template-columns:130px minmax(0,1fr)}.refresh-wrap{right:auto;left:18px}}
+@media(max-width:480px){.story-link{display:flex;flex-direction:column}.image-wrap{order:0}.story-copy{order:1}.source-mark{right:8px;left:auto}.update-time{align-self:flex-start}}

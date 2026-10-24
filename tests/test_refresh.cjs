@@ -1,0 +1,16 @@
+const fs = require('node:fs');
+const assert = require('node:assert/strict');
+const source = fs.readFileSync(require('node:path').join(__dirname, '../app.js'), 'utf8');
+const start = source.indexOf('function mergeSource(');
+const end = source.indexOf('async function refresh()', start);
+const merge = new Function(source.slice(start, end) + '; return mergeSource;')();
+const items = (...ids) => ids.map(id => ({ id, title: id, url: `https://example.org/${id}` }));
+let state = { items: [], sources: {} };
+assert.equal(merge(state, 'GS', items('3', '2', '1'), true), 3);
+assert.equal(merge(state, 'GS', items('5', '4'), true), 2);
+assert.equal(merge(state, 'GS', items('5', '4'), true), 0);
+assert.deepEqual(state.sources.GS.seen, ['3', '2', '1', '5', '4']);
+const before = JSON.stringify(state.sources.GS);
+assert.equal(merge(state, 'GS', items('6'), false), 1);
+assert.equal(JSON.stringify(state.sources.GS), before);
+console.log('PASS: merge, deduplication, and incomplete-crawl checkpoint protection');
