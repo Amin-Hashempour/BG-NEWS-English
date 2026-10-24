@@ -1,5 +1,5 @@
 'use strict';
-const STORAGE = 'noqte.global-news.v1';
+const STORAGE = 'checkpoint.global-news.v2';
 const names = { GS: 'GameSpot', GI: 'Game Informer', PS: 'Push Square', GE: 'Gematsu', VGC: 'VGC' };
 let state = { items: [], sources: {}, lastUpdate: null };
 let filter = 'all';
@@ -14,7 +14,8 @@ function httpURL(value) {
   catch { return ''; }
 }
 function imageURL(value) {
-  return typeof value === 'string' && /^\/api\/image\/[a-f0-9]{64}$/.test(value) ? value : '';
+  if (typeof value === 'string' && /^\/api\/image\/[a-f0-9]{64}$/.test(value)) return value;
+  return httpURL(value);
 }
 function message(text, error = false) {
   const node = document.createElement('div');
@@ -37,7 +38,13 @@ function render() {
     const imageWrap = document.createElement('div'); imageWrap.className = 'image-wrap';
     const fallback = () => { imageWrap.replaceChildren(); const symbol = document.createElement('span'); symbol.textContent = item.source; imageWrap.append(symbol); };
     if (imageURL(item.image)) {
-      const image = document.createElement('img'); image.src = item.image; image.alt = ''; image.loading = 'lazy'; image.addEventListener('error', fallback, { once: true }); imageWrap.append(image);
+      const image = document.createElement('img'); image.src = imageURL(item.image); image.alt = ''; image.loading = 'lazy';
+      image.addEventListener('error', () => {
+        const original = imageURL(item.originalImage);
+        if (original && image.src !== original) image.src = original;
+        else fallback();
+      });
+      imageWrap.append(image);
     } else fallback();
     const copy = document.createElement('div'); copy.className = 'story-copy';
     const meta = document.createElement('div'); meta.className = 'card-meta';

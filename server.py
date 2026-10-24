@@ -18,6 +18,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parent
+IMAGE_CACHE_FILE = ROOT / ".image-urls.json"
 MAX_PAGES = 50
 SOURCES = {
     "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query",
@@ -32,7 +33,17 @@ SOURCES = {
             "feed": "https://www.videogameschronicle.com/category/news/feed/"},
 }
 SOURCE_HOSTS = {urlsplit(source["url"]).hostname for source in SOURCES.values()}
-IMAGE_URLS: dict[str, tuple[str, str]] = {}
+def load_image_urls() -> dict[str, tuple[str, str]]:
+    try:
+        raw = json.loads(IMAGE_CACHE_FILE.read_text("utf-8"))
+        return {token: (value[0], value[1]) for token, value in raw.items()
+                if re.fullmatch(r"[a-f0-9]{64}", token) and isinstance(value, list) and len(value) == 2
+                and all(isinstance(part, str) for part in value)}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
+IMAGE_URLS: dict[str, tuple[str, str]] = load_image_urls()
 IMAGE_LOCK = threading.Lock()
 
 
@@ -306,12 +317,23 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
 
 
 def add_image_proxies(items: list[dict]) -> list[dict]:
+    changed = False
     for item in items:
         if item.get("image"):
-            token = hashlib.sha256(item["image"].encode()).hexdigest()
+            original = item["image"]
+            token = hashlib.sha256(original.encode()).hexdigest()
             with IMAGE_LOCK:
-                IMAGE_URLS[token] = (item["image"], item["url"])
+                if IMAGE_URLS.get(token) != (original, item["url"]):
+                    IMAGE_URLS[token] = (original, item["url"])
+                    changed = True
+            item["originalImage"] = original
             item["image"] = "/api/image/" + token
+    if changed:
+        with IMAGE_LOCK:
+            try:
+                IMAGE_CACHE_FILE.write_text(json.dumps(IMAGE_URLS, ensure_ascii=False), "utf-8")
+            except OSError:
+                pass
     return items
 
 
@@ -363,8 +385,12 @@ class Handler(SimpleHTTPRequestHandler):
                 self.send_error(404)
                 return
             try:
-                data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
-                                               referer=image[1], limit=10 * 1024 * 1024, timeout=15)
+                try:
+                    data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
+                                                   referer=image[1], limit=10 * 1024 * 1024, timeout=15)
+                except Exception:
+                    data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
+                                                   limit=10 * 1024 * 1024, timeout=15)
                 image_type = image_content_type(data, reported)
                 if not image_type:
                     raise ValueError("Not an image")

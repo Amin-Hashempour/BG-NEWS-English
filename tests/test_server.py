@@ -41,6 +41,15 @@ class ParserTests(unittest.TestCase):
     def test_image_signature_fallback(self):
         self.assertEqual(server.image_content_type(b"RIFF1234WEBP", "application/octet-stream"), "image/webp")
 
+    @patch("pathlib.Path.write_text")
+    def test_image_proxy_keeps_direct_fallback_and_stable_mapping(self, write_text):
+        item = {"id": "story", "url": "https://example.org/story", "title": "Story",
+                "image": "https://cdn.example.org/image.webp", "published": ""}
+        server.add_image_proxies([item])
+        self.assertEqual(item["originalImage"], "https://cdn.example.org/image.webp")
+        self.assertRegex(item["image"], r"^/api/image/[a-f0-9]{64}$")
+        self.assertIn(item["image"].rsplit("/", 1)[-1], server.IMAGE_URLS)
+
     @patch("server.request_bytes")
     def test_crawler_follows_pages_until_known_item(self, request):
         first = b'<article><h2><a href="/new">A completely new gaming story</a></h2></article><a rel="next" href="/news?page=2">Next</a>'
