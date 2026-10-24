@@ -14,10 +14,21 @@ function httpURL(value) {
   try { const url = new URL(value); return ['https:', 'http:'].includes(url.protocol) ? url.href : ''; }
   catch { return ''; }
 }
+function originalImageURL(item) {
+  const original = httpURL(item.originalImage) || httpURL(item.image);
+  if (!original) return '';
+  const url = new URL(original);
+  // Push Square serves the same bytes through its first-party image endpoint.
+  // This also repairs saved stories whose CDN host is denied by the publisher.
+  if (item.source === 'PS' && url.hostname === 'images.pushsquare.com' && /^\/[a-f0-9]+\//i.test(url.pathname)) {
+    return 'https://www.pushsquare.com/images' + url.pathname + url.search;
+  }
+  return original;
+}
 function storyImageURL(item) {
   const article = httpURL(item.url);
   if (!article) return '';
-  const original = httpURL(item.originalImage) || httpURL(item.image);
+  const original = originalImageURL(item);
   return '/api/story-image?' + new URLSearchParams({ article, image: original });
 }
 function message(text, error = false) {
@@ -31,17 +42,17 @@ function persist() {
   catch { message('Browser storage is unavailable. Your list will not persist after closing this page.', true); }
 }
 function render() {
-  const selected = state.items.filter(item => filter === 'all' || item.source === filter);
   $('articles').replaceChildren();
-  for (const item of selected) {
+  for (const item of state.items) {
     if (!httpURL(item.url) || !names[item.source]) continue;
-    const card = document.createElement('article'); card.className = 'card';
+    const card = document.createElement('article'); card.className = 'card'; card.dataset.source = item.source;
+    card.hidden = filter !== 'all' && item.source !== filter;
     const mark = document.createElement('span'); mark.className = `source-mark source-${item.source.toLowerCase()}`; mark.textContent = item.source; mark.title = names[item.source];
     const link = document.createElement('a'); link.className = 'story-link'; link.href = item.url; link.target = '_blank'; link.rel = 'noopener noreferrer';
     const imageWrap = document.createElement('div'); imageWrap.className = 'image-wrap';
     // Reconstruct the local URL from the article, including for legacy history
     // whose RAM tokens or original image fields are missing or incorrect.
-    const candidates = [...new Set([storyImageURL(item), httpURL(item.originalImage) || httpURL(item.image)].filter(Boolean))];
+    const candidates = [...new Set([storyImageURL(item), originalImageURL(item)].filter(Boolean))];
     const image = document.createElement('img'); image.alt = ''; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer';
     let candidate = 0;
     let failureDetail = '';
@@ -83,8 +94,17 @@ function render() {
     meta.append(source, time); copy.append(meta, title); link.append(imageWrap, copy); card.append(mark, link); $('articles').append(card);
   }
   $('total').textContent = state.items.length.toLocaleString('en-US');
-  $('empty').hidden = selected.length > 0;
+  applyFilter();
   if (state.lastUpdate) $('update-time').textContent = 'Last checked: ' + new Date(state.lastUpdate).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+
+function applyFilter() {
+  let visible = 0;
+  for (const card of $('articles').children) {
+    card.hidden = filter !== 'all' && card.dataset.source !== filter;
+    if (!card.hidden) visible++;
+  }
+  $('empty').hidden = visible > 0;
 }
 
 function mergeSource(current, code, incoming, complete = true) {
@@ -130,11 +150,11 @@ async function refresh() {
 document.querySelectorAll('.filter').forEach(button => button.addEventListener('click', () => {
   filter = button.dataset.filter;
   document.querySelectorAll('.filter').forEach(item => { const active = item === button; item.classList.toggle('active', active); item.setAttribute('aria-pressed', String(active)); });
-  render();
+  applyFilter();
 }));
 $('refresh').addEventListener('click', refresh);
 render();
 if (location.protocol === 'file:') message('Run python3 server.py, then open http://127.0.0.1:8766 in your browser.', true);
 else fetch('/api/health', { cache: 'no-store' }).then(response => response.json()).then(health => {
-  if (health.version !== '1.3.1') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
+  if (health.version !== '1.3.2') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
 }).catch(() => message('The local server is unavailable. Run python3 server.py from this project folder.', true));

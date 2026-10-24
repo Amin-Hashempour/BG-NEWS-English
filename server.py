@@ -416,7 +416,12 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
                 continue
             if item["id"] not in collected_ids:
                 collected_ids.add(item["id"])
-                collected.append(feed_by_id.get(item["id"], item))
+                enriched = dict(feed_by_id.get(item["id"], item))
+                # Listing thumbnails are much smaller than full-size RSS images.
+                # Preserve RSS titles/dates while using the publisher's preview.
+                if allowed_image_url(item.get("image", ""), item["url"]):
+                    enriched["image"] = item["image"]
+                collected.append(enriched)
         if reached_known or not known_ids:
             break
         candidate = next_url or fallback_page_url(source, page + 1)
@@ -434,6 +439,9 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
 def add_image_proxies(items: list[dict]) -> list[dict]:
     for item in items:
         original = item.get("originalImage") or item.get("image", "")
+        choices = publisher_image_urls(original, item["url"])
+        if choices:
+            original = choices[0]
         item["originalImage"] = original
         # Each URL carries its own recovery information; no RAM token or JSON
         # mapping is needed, even for old browser history on a fresh installation.
@@ -472,39 +480,67 @@ def allowed_image_url(value: str, article: str) -> str:
     return url
 
 
+def publisher_image_urls(value: str, article: str) -> list[str]:
+    url = allowed_image_url(value, article)
+    if not url:
+        return []
+    parts = urlsplit(url)
+    if parts.hostname == "images.pushsquare.com" and re.match(r"^/[a-f0-9]+/", parts.path, re.I):
+        # Verified against the CDN: same image bytes, served by the publisher's
+        # main domain without redirecting back to the denied CDN hostname.
+        first_party = urlunsplit(("https", "www.pushsquare.com", "/images" + parts.path, parts.query, ""))
+        return [first_party, url]
+    return [url]
+
+
+def store_image_file(cache_file: Path, data: bytes):
+    try:
+        IMAGE_FILES.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=IMAGE_FILES, delete=False) as temporary:
+            temporary.write(data)
+            temporary_path = Path(temporary.name)
+        temporary_path.replace(cache_file)
+    except OSError:
+        pass  # A read-only project directory must not prevent image display.
+
+
 def get_story_image(article: str, hint: str = "") -> tuple[bytes, str]:
     source_for_article(article)
-    key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
+    key = hashlib.sha256(article.encode()).hexdigest()
     cache_file = IMAGE_FILES / (key + ".img")
+    legacy_key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
     with IMAGE_FETCH_LOCKS[int(key[:2], 16) % len(IMAGE_FETCH_LOCKS)]:
-        try:
-            cached = cache_file.read_bytes()
-            kind = image_content_type(cached, "")
-            if kind:
-                return cached, kind
-        except OSError:
-            pass
+        # A thumbnail/feed URL change must not download the same story again.
+        # Reuse the preceding version's cache files without discarding history.
+        for existing_file in (cache_file, IMAGE_FILES / (legacy_key + ".img")):
+            try:
+                cached = existing_file.read_bytes()
+                kind = image_content_type(cached, "")
+                if kind:
+                    if existing_file != cache_file:
+                        store_image_file(cache_file, cached)
+                    return cached, kind
+            except OSError:
+                pass
         with IMAGE_DOWNLOADS:
             tried = set()
             errors = []
 
             def download(candidate):
-                url = allowed_image_url(candidate, article)
-                if not url or url in tried:
-                    return None
-                tried.add(url)
-                # Prefer no Referer: this avoids sending localhost to hotlink
-                # protection. Some publishers require their own article Referer.
-                for referer in ("", article):
-                    try:
-                        data, reported = request_image_transport(url, accept=IMAGE_ACCEPT, referer=referer,
-                                                                 timeout=12, limit=10 * 1024 * 1024)
-                        kind = image_content_type(data, reported)
-                        if kind:
-                            return data, kind
-                        errors.append(f"{urlsplit(url).hostname} returned a non-image response")
-                    except Exception as exc:
-                        errors.append(failure_description(exc, url))
+                for url in publisher_image_urls(candidate, article):
+                    if url in tried:
+                        continue
+                    tried.add(url)
+                    for referer in ("", article):
+                        try:
+                            data, reported = request_image_transport(url, accept=IMAGE_ACCEPT, referer=referer,
+                                                                     timeout=12, limit=10 * 1024 * 1024)
+                            kind = image_content_type(data, reported)
+                            if kind:
+                                return data, kind
+                            errors.append(f"{urlsplit(url).hostname} returned a non-image response")
+                        except Exception as exc:
+                            errors.append(failure_description(exc, url))
                 return None
 
             result = download(hint)
@@ -523,14 +559,7 @@ def get_story_image(article: str, hint: str = "") -> tuple[bytes, str]:
             if result is None:
                 detail = "; ".join(dict.fromkeys(errors[-3:])) or "The publisher did not provide an article image"
                 raise ImageFetchError(detail, tried)
-        try:
-            IMAGE_FILES.mkdir(exist_ok=True)
-            with tempfile.NamedTemporaryFile(dir=IMAGE_FILES, delete=False) as temporary:
-                temporary.write(result[0])
-                temporary_path = Path(temporary.name)
-            temporary_path.replace(cache_file)
-        except OSError:
-            pass  # A read-only project directory must not prevent image display.
+        store_image_file(cache_file, result[0])
         return result
 
 
@@ -610,7 +639,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.1"})
+            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.2"})
         elif path == "/api/image-status":
             query = parse_qs(urlsplit(self.path).query)
             article = query.get("article", [""])[0]
@@ -641,7 +670,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Checkpoint 1.3.1: http://127.0.0.1:{args.port}", flush=True)
+    print(f"Checkpoint 1.3.2: http://127.0.0.1:{args.port}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

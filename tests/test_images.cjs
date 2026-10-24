@@ -12,7 +12,7 @@ const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
 let server;
 let browser;
-const transportCache = process.env.BGNEWS_FORCE_CURL ? fs.mkdtempSync(path.join(os.tmpdir(), 'bgnews-curl-test-')) : '';
+const transportCache = process.env.BGNEWS_FORCE_CURL || process.env.BGNEWS_DENY_PUSH_CDN ? fs.mkdtempSync(path.join(os.tmpdir(), 'bgnews-image-test-')) : '';
 
 async function startServer(port) {
   const forcedTransport = `
@@ -20,13 +20,19 @@ import server, ssl
 from pathlib import Path
 original = server.request_bytes
 def fail_python_images(url, **kwargs):
-    if kwargs.get('accept', '').startswith('image/'):
+    if ${process.env.BGNEWS_FORCE_CURL ? 'True' : 'False'} and kwargs.get('accept', '').startswith('image/'):
         raise ssl.SSLCertVerificationError('Simulated Python-only TLS failure')
     return original(url, **kwargs)
 server.request_bytes = fail_python_images
+original_image_transport = server.request_image_transport
+def denied_cdn(url, **kwargs):
+    if ${process.env.BGNEWS_DENY_PUSH_CDN ? 'True' : 'False'} and server.urlsplit(url).hostname == 'images.pushsquare.com':
+        raise server.HTTPError(url, 403, 'Simulated publisher CDN denial', {}, None)
+    return original_image_transport(url, **kwargs)
+server.request_image_transport = denied_cdn
 server.IMAGE_FILES = Path(${JSON.stringify(transportCache)})
 httpd = server.ThreadingHTTPServer(('127.0.0.1', ${port}), server.Handler)
-print('Forced Python TLS failure: testing real OS curl downloads', flush=True)
+print('Testing publisher images with a fresh cache and controlled transport failures', flush=True)
 httpd.serve_forever()
 `;
   const args = transportCache ? ['-u', '-c', forcedTransport] : ['-u', 'server.py', '--port', String(port)];
@@ -48,14 +54,14 @@ async function stopServer() {
 async function checkImages(page, phase, expected) {
   for (const code of ['PS', 'GE', 'VGC']) {
     await page.locator(`[data-filter="${code}"]`).click();
-    const cards = page.locator('.card');
+    const cards = page.locator('.card:not([hidden])');
     assert.equal(await cards.count(), expected[code], `${phase}: ${code} story count`);
     for (let index = 0; index < expected[code]; index++) {
       const card = cards.nth(index);
       await card.scrollIntoViewIfNeeded();
       await card.locator('img').waitFor({ timeout: 45000 });
       await page.waitForFunction(({ code, index }) => {
-        const card = document.querySelectorAll('.card')[index];
+        const card = document.querySelectorAll('.card:not([hidden])')[index];
         const img = card?.querySelector('img');
         return img?.complete && img.naturalWidth > 0;
       }, { code, index }, { timeout: 45000 });
@@ -87,6 +93,8 @@ async function checkImages(page, phase, expected) {
   browser = await chromium.launch({ headless: true, executablePath: installedChromium, args: ['--no-sandbox'] });
   const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
   const page = await context.newPage();
+  let imageRequests = 0;
+  page.on('request', request => { if (request.url().includes('/api/story-image?')) imageRequests++; });
   // External browser image requests are blocked, so a passing test proves that
   // our server downloaded the publisher image and the browser decoded its bytes.
   await page.route(/^https:\/\//, route => route.abort());
@@ -102,6 +110,23 @@ async function checkImages(page, phase, expected) {
     assert.ok(expected[code] > 0);
   }
   await checkImages(page, 'live news', expected);
+  const beforeSwitch = imageRequests;
+  await page.locator('.card[data-source="VGC"] img').first().evaluate(image => { window.retainedTestImage = image; });
+  for (let round = 0; round < 3; round++) {
+    for (const code of ['GE', 'PS', 'VGC']) {
+      await page.locator(`[data-filter="${code}"]`).click();
+      const decoded = await page.locator('.card:not([hidden]) img').evaluateAll(images => images.every(image => image.complete && image.naturalWidth > 0));
+      assert.ok(decoded, `${code} images must be ready immediately on return`);
+    }
+  }
+  const otherTab = await context.newPage();
+  await otherTab.goto('about:blank');
+  await page.bringToFront();
+  await otherTab.close();
+  await page.waitForTimeout(150);
+  assert.equal(imageRequests, beforeSwitch, 'Switching source tabs must make ZERO image requests');
+  assert.ok(await page.locator('.card[data-source="VGC"] img').first().evaluate(image => image === window.retainedTestImage), 'The decoded image node must be retained');
+  console.log('PASS tab switching: zero image requests, no image node recreation, and all images immediately decoded');
   await page.locator('[data-filter="VGC"]').click();
   await page.evaluate(() => scrollTo(0, 0));
   if (process.env.BGNEWS_SCREENSHOT) await page.screenshot({ path: process.env.BGNEWS_SCREENSHOT });

@@ -56,13 +56,53 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(server.safe_url("", "https://www.videogameschronicle.com/category/news/"), "")
 
     def test_image_url_is_self_contained_without_a_saved_mapping(self):
-        item = {"id": "story", "url": "https://example.org/story", "title": "Story",
-                "image": "https://cdn.example.org/image.webp", "published": ""}
+        item = {"id": "story", "url": "https://www.gematsu.com/story", "title": "Story",
+                "image": "https://www.gematsu.com/image.webp", "published": ""}
         server.add_image_proxies([item])
-        self.assertEqual(item["originalImage"], "https://cdn.example.org/image.webp")
+        self.assertEqual(item["originalImage"], "https://www.gematsu.com/image.webp")
         query = server.parse_qs(server.urlsplit(item["image"]).query)
         self.assertEqual(query["article"], [item["url"]])
         self.assertEqual(query["image"], [item["originalImage"]])
+
+    @patch("server.request_image_transport")
+    def test_push_square_uses_first_party_image_when_cdn_is_forbidden(self, request):
+        article = "https://www.pushsquare.com/news/2026/10/story"
+        cdn = "https://images.pushsquare.com/6976f1890c71d/small.jpg"
+        first_party = "https://www.pushsquare.com/images/6976f1890c71d/small.jpg"
+        png = b"\x89PNG\r\n\x1a\nreal-image-data"
+        def respond(url, **kwargs):
+            if server.urlsplit(url).hostname == "images.pushsquare.com":
+                raise server.HTTPError(url, 403, "Forbidden", {}, None)
+            self.assertEqual(url, first_party)
+            return png, "image/png"
+        request.side_effect = respond
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "IMAGE_FILES", Path(directory)):
+            self.assertEqual(server.get_story_image(article, cdn), (png, "image/png"))
+        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_args.args[0], first_party)
+
+    @patch("server.request_image_transport")
+    def test_story_cache_is_reused_if_thumbnail_hint_changes(self, request):
+        article = "https://www.gematsu.com/2026/10/story"
+        png = b"\x89PNG\r\n\x1a\nreal-image-data"
+        request.return_value = (png, "image/png")
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "IMAGE_FILES", Path(directory)):
+            self.assertEqual(server.get_story_image(article, "https://www.gematsu.com/small.jpg"), (png, "image/png"))
+            request.side_effect = AssertionError("The already downloaded story must not be fetched again")
+            self.assertEqual(server.get_story_image(article, "https://www.gematsu.com/large.jpg"), (png, "image/png"))
+        self.assertEqual(request.call_count, 1)
+
+    @patch("server.fetch_feed")
+    @patch("server.request_bytes")
+    def test_listing_thumbnail_keeps_feed_title_and_date(self, request, feed):
+        article = "https://example.org/news/story"
+        feed.return_value = [{"url": article, "id": article, "title": "Exact publisher title", "published": "2026-10-24T10:00:00Z", "image": "https://example.org/full.jpg"}]
+        request.return_value = (b'<article><a href="/news/story"><img data-srcset="/preview-480.jpg 480w, /full.jpg 1920w"><h2>Story card with other metadata</h2></a></article>', "text/html")
+        with patch.dict(server.SOURCES, {"X": {"name": "Example", "url": "https://example.org/news", "page": "query"}}, clear=True):
+            _, result = server.crawl_source("X", set())
+        self.assertEqual(result["items"][0]["title"], "Exact publisher title")
+        self.assertEqual(result["items"][0]["published"], "2026-10-24T10:00:00Z")
+        self.assertEqual(result["items"][0]["image"], "https://example.org/preview-480.jpg")
 
     @patch("server.request_bytes")
     def test_wrong_legacy_image_is_recovered_and_cached_across_restarts(self, request):
