@@ -7,6 +7,9 @@ import concurrent.futures
 import hashlib
 import json
 import re
+import shutil
+import ssl
+import subprocess
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
@@ -17,6 +20,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 ROOT = Path(__file__).resolve().parent
 IMAGE_CACHE_FILE = ROOT / ".image-urls.json"
@@ -24,6 +28,7 @@ IMAGE_FILES = ROOT / ".image-cache"
 IMAGE_FETCH_LOCKS = [threading.Lock() for _ in range(64)]
 IMAGE_DOWNLOADS = threading.BoundedSemaphore(6)
 IMAGE_ACCEPT = "image/jpeg,image/png,image/webp,image/*;q=0.8"
+IMAGE_ERRORS: dict[str, dict] = {}
 MAX_PAGES = 50
 SOURCES = {
     "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query",
@@ -80,6 +85,71 @@ def request_bytes(url: str, *, accept: str, referer: str = "", limit: int = 8 * 
     if len(data) > limit:
         raise ValueError("Response too large")
     return data, content_type
+
+
+def failure_description(exc: Exception, url: str) -> str:
+    host = urlsplit(url).hostname or "publisher"
+    if isinstance(exc, HTTPError):
+        return f"HTTP {exc.code} from {host}"
+    reason = exc.reason if isinstance(exc, URLError) else exc
+    proxy_denial = re.search(r"Tunnel connection failed: (\d{3})", str(reason))
+    if proxy_denial:
+        return f"Proxy denied access to {host} (HTTP {proxy_denial.group(1)})"
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return f"TLS certificate verification failed for {host}"
+    if isinstance(reason, (TimeoutError,)):
+        return f"Connection to {host} timed out"
+    if isinstance(reason, ssl.SSLError):
+        return f"TLS connection to {host} failed"
+    if isinstance(exc, ImageFetchError):
+        return str(exc)
+    return f"Could not connect to {host} ({type(reason).__name__})"
+
+
+class ImageFetchError(Exception):
+    def __init__(self, message, candidates=()):
+        super().__init__(message)
+        self.candidates = list(candidates)
+
+
+def request_image_transport(url: str, *, accept: str, referer: str = "",
+                            limit: int = 10 * 1024 * 1024, timeout: int = 12):
+    """Use OS curl when Python's HTTPS stack fails. TLS checks stay enabled."""
+    try:
+        return request_bytes(url, accept=accept, referer=referer, limit=limit, timeout=timeout)
+    except Exception as python_error:
+        curl = shutil.which("curl.exe") or shutil.which("curl")
+        if not curl:
+            raise ImageFetchError(failure_description(python_error, url)) from python_error
+        with tempfile.TemporaryDirectory(prefix="checkpoint-image-") as directory:
+            output = Path(directory) / "response"
+            command = [curl, "--silent", "--show-error", "--location", "--compressed",
+                       "--proto", "=http,https", "--proto-redir", "=http,https",
+                       "--max-time", str(timeout), "--connect-timeout", "8",
+                       "--max-filesize", str(limit), "--output", str(output),
+                       "--write-out", "%{http_code}\n%{content_type}",
+                       "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+                       "--header", "Accept: " + accept]
+            if referer:
+                command.extend(["--referer", referer])
+            command.append(url)
+            try:
+                response = subprocess.run(command, capture_output=True, timeout=timeout + 3, check=False)
+                metadata = response.stdout.decode("utf-8", errors="replace").splitlines()
+                status = int(metadata[0]) if metadata and metadata[0].isdigit() else 0
+                host = urlsplit(url).hostname
+                if response.returncode:
+                    detail = {60: "TLS certificate verification failed", 28: "Connection timed out",
+                              6: "DNS lookup failed", 5: "Proxy lookup failed", 35: "TLS connection failed"}.get(response.returncode, f"curl error {response.returncode}")
+                    raise ImageFetchError(f"{failure_description(python_error, url)}; OS transport: {detail} for {host}")
+                if status < 200 or status >= 300:
+                    raise ImageFetchError(f"{failure_description(python_error, url)}; OS transport: HTTP {status} from {host}")
+                data = output.read_bytes()
+                if len(data) > limit:
+                    raise ImageFetchError("Publisher response exceeded the image size limit")
+                return data, (metadata[1].split(";", 1)[0] if len(metadata) > 1 else "application/octet-stream")
+            except subprocess.TimeoutExpired as exc:
+                raise ImageFetchError(f"Connection to {urlsplit(url).hostname} timed out in both transports") from exc
 
 
 def image_content_type(data: bytes, reported: str) -> str:
@@ -416,6 +486,7 @@ def get_story_image(article: str, hint: str = "") -> tuple[bytes, str]:
             pass
         with IMAGE_DOWNLOADS:
             tried = set()
+            errors = []
 
             def download(candidate):
                 url = allowed_image_url(candidate, article)
@@ -426,27 +497,32 @@ def get_story_image(article: str, hint: str = "") -> tuple[bytes, str]:
                 # protection. Some publishers require their own article Referer.
                 for referer in ("", article):
                     try:
-                        data, reported = request_bytes(url, accept=IMAGE_ACCEPT, referer=referer,
-                                                       timeout=12, limit=10 * 1024 * 1024)
+                        data, reported = request_image_transport(url, accept=IMAGE_ACCEPT, referer=referer,
+                                                                 timeout=12, limit=10 * 1024 * 1024)
                         kind = image_content_type(data, reported)
                         if kind:
                             return data, kind
-                    except Exception:
-                        continue
+                        errors.append(f"{urlsplit(url).hostname} returned a non-image response")
+                    except Exception as exc:
+                        errors.append(failure_description(exc, url))
                 return None
 
             result = download(hint)
             if result is None:
-                data, kind = request_bytes(article, accept="text/html,application/xhtml+xml",
-                                           timeout=15, limit=4 * 1024 * 1024)
-                parser = ArticleImages(article)
-                parser.feed(data.decode("utf-8", errors="replace"))
-                for candidate in parser.urls[:8]:
-                    result = download(candidate)
-                    if result is not None:
-                        break
+                try:
+                    data, kind = request_image_transport(article, accept="text/html,application/xhtml+xml",
+                                                         timeout=15, limit=4 * 1024 * 1024)
+                    parser = ArticleImages(article)
+                    parser.feed(data.decode("utf-8", errors="replace"))
+                    for candidate in parser.urls[:8]:
+                        result = download(candidate)
+                        if result is not None:
+                            break
+                except Exception as exc:
+                    errors.append(failure_description(exc, article))
             if result is None:
-                raise ValueError("The publisher did not provide a downloadable article image")
+                detail = "; ".join(dict.fromkeys(errors[-3:])) or "The publisher did not provide an article image"
+                raise ImageFetchError(detail, tried)
         try:
             IMAGE_FILES.mkdir(exist_ok=True)
             with tempfile.NamedTemporaryFile(dir=IMAGE_FILES, delete=False) as temporary:
@@ -496,9 +572,19 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             data, image_type = get_story_image(article, hint)
         except Exception as exc:
-            self.log_error("Publisher image failed (%s)", type(exc).__name__)
-            self.send_error(502, "The publisher image is currently unavailable")
+            detail = failure_description(exc, article)
+            candidates = getattr(exc, "candidates", [])
+            key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
+            with IMAGE_LOCK:
+                if len(IMAGE_ERRORS) >= 512:
+                    IMAGE_ERRORS.pop(next(iter(IMAGE_ERRORS)))
+                IMAGE_ERRORS[key] = {"error": detail, "candidates": candidates}
+            self.log_error("Publisher image failed: %s", detail)
+            self.json_response({"error": detail}, 502)
             return
+        key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
+        with IMAGE_LOCK:
+            IMAGE_ERRORS.pop(key, None)
         self.send_response(200)
         self.send_header("Content-Type", image_type)
         self.send_header("Cache-Control", "private, max-age=86400")
@@ -524,7 +610,15 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.0"})
+            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.1"})
+        elif path == "/api/image-status":
+            query = parse_qs(urlsplit(self.path).query)
+            article = query.get("article", [""])[0]
+            hint = query.get("image", [""])[0]
+            key = hashlib.sha256((article + "\n" + hint).encode()).hexdigest()
+            with IMAGE_LOCK:
+                status = IMAGE_ERRORS.get(key, {"error": "The browser could not display this image", "candidates": []})
+            self.json_response(status)
         elif path == "/api/story-image":
             query = parse_qs(urlsplit(self.path).query)
             self.serve_story_image(query.get("article", [""])[0], query.get("image", [""])[0])
@@ -547,7 +641,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Checkpoint 1.3.0: http://127.0.0.1:{args.port}", flush=True)
+    print(f"Checkpoint 1.3.1: http://127.0.0.1:{args.port}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

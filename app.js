@@ -3,6 +3,7 @@ const STORAGE = 'checkpoint.global-news.v2';
 const names = { GS: 'GameSpot', GI: 'Game Informer', PS: 'Push Square', GE: 'Gematsu', VGC: 'VGC' };
 let state = { items: [], sources: {}, lastUpdate: null };
 let filter = 'all';
+const imageFailureNotices = new Set();
 const $ = id => document.getElementById(id);
 try {
   const saved = JSON.parse(localStorage.getItem(STORAGE));
@@ -43,13 +44,30 @@ function render() {
     const candidates = [...new Set([storyImageURL(item), httpURL(item.originalImage) || httpURL(item.image)].filter(Boolean))];
     const image = document.createElement('img'); image.alt = ''; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer';
     let candidate = 0;
-    image.addEventListener('error', () => {
+    let failureDetail = '';
+    image.addEventListener('error', async () => {
+      if (candidate === 0) {
+        try {
+          const response = await fetch(candidates[0].replace('/api/story-image?', '/api/image-status?'), { cache: 'no-store' });
+          const status = await response.json();
+          failureDetail = status.error || '';
+          for (const value of status.candidates || []) {
+            const url = httpURL(value);
+            if (url && !candidates.includes(url)) candidates.push(url);
+          }
+        } catch { failureDetail = 'Could not read the local image status'; }
+      }
       candidate++;
       if (candidate < candidates.length) { image.src = candidates[candidate]; return; }
       imageWrap.replaceChildren();
       const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'retry-image'; retry.textContent = 'Retry image';
+      retry.title = failureDetail || 'The publisher image could not be loaded';
+      if (!imageFailureNotices.has(item.source)) {
+        imageFailureNotices.add(item.source);
+        message(`${names[item.source]} image download failed: ${retry.title}`, true);
+      }
       retry.addEventListener('click', event => {
-        event.preventDefault(); event.stopPropagation(); candidate = 0;
+        event.preventDefault(); event.stopPropagation(); candidate = 0; imageFailureNotices.delete(item.source);
         imageWrap.replaceChildren(image); image.src = candidates[0];
       });
       imageWrap.append(retry);
@@ -85,7 +103,7 @@ function mergeSource(current, code, incoming, complete = true) {
 }
 
 async function refresh() {
-  const button = $('refresh'); button.disabled = true; button.setAttribute('aria-busy', 'true'); $('refresh-label').textContent = 'Checking…'; $('messages').replaceChildren();
+  const button = $('refresh'); button.disabled = true; button.setAttribute('aria-busy', 'true'); $('refresh-label').textContent = 'Checking…'; $('messages').replaceChildren(); imageFailureNotices.clear();
   const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 120000);
   try {
     const known = Object.fromEntries(Object.keys(names).map(code => [code, state.sources[code]?.seen || []]));
@@ -118,5 +136,5 @@ $('refresh').addEventListener('click', refresh);
 render();
 if (location.protocol === 'file:') message('Run python3 server.py, then open http://127.0.0.1:8766 in your browser.', true);
 else fetch('/api/health', { cache: 'no-store' }).then(response => response.json()).then(health => {
-  if (health.version !== '1.3.0') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
+  if (health.version !== '1.3.1') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
 }).catch(() => message('The local server is unavailable. Run python3 server.py from this project folder.', true));

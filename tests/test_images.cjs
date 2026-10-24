@@ -6,14 +6,31 @@ const { once } = require('node:events');
 const net = require('node:net');
 const path = require('node:path');
 const fs = require('node:fs');
+const os = require('node:os');
 const { chromium } = require('playwright');
 
 const root = path.resolve(__dirname, '..');
 let server;
 let browser;
+const transportCache = process.env.BGNEWS_FORCE_CURL ? fs.mkdtempSync(path.join(os.tmpdir(), 'bgnews-curl-test-')) : '';
 
 async function startServer(port) {
-  server = spawn(process.env.PYTHON || 'python3', ['-u', 'server.py', '--port', String(port)], { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
+  const forcedTransport = `
+import server, ssl
+from pathlib import Path
+original = server.request_bytes
+def fail_python_images(url, **kwargs):
+    if kwargs.get('accept', '').startswith('image/'):
+        raise ssl.SSLCertVerificationError('Simulated Python-only TLS failure')
+    return original(url, **kwargs)
+server.request_bytes = fail_python_images
+server.IMAGE_FILES = Path(${JSON.stringify(transportCache)})
+httpd = server.ThreadingHTTPServer(('127.0.0.1', ${port}), server.Handler)
+print('Forced Python TLS failure: testing real OS curl downloads', flush=True)
+httpd.serve_forever()
+`;
+  const args = transportCache ? ['-u', '-c', forcedTransport] : ['-u', 'server.py', '--port', String(port)];
+  server = spawn(process.env.PYTHON || 'python3', args, { cwd: root, stdio: ['ignore', 'pipe', 'pipe'] });
   server.stderr.on('data', () => {});
   await Promise.race([
     once(server.stdout, 'data'),
@@ -107,6 +124,14 @@ async function checkImages(page, phase, expected) {
   await checkImages(page, 'legacy history with missing tokens and no original URLs', { PS: 1, GE: 1, VGC: 1 });
   assert.equal(await page.locator('.retry-image').count(), 0);
 
+  // A local publisher denial must expose its precise cause in the UI.
+  await page.route('**/api/story-image?*', route => route.fulfill({ status: 502, body: 'Blocked' }));
+  await page.route('**/api/image-status?*', route => route.fulfill({ json: { error: 'HTTP 403 from www.gematsu.com', candidates: [] } }));
+  await page.reload();
+  await page.locator('[data-filter="GE"]').click();
+  await page.getByText('Gematsu image download failed: HTTP 403 from www.gematsu.com', { exact: true }).waitFor();
+  console.log('PASS publisher denial: exact upstream status is visible beside the image failure');
+
   await page.route('**/api/health', route => route.fulfill({ json: { ok: true, sources: 5 } }));
   await page.reload();
   await page.getByText('An older server is still running.', { exact: false }).waitFor();
@@ -114,4 +139,5 @@ async function checkImages(page, phase, expected) {
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
   if (browser) await browser.close();
   await stopServer();
+  if (transportCache) fs.rmSync(transportCache, { recursive: true, force: true });
 });

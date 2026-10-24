@@ -1,4 +1,6 @@
 import base64
+import ssl
+import subprocess
 from pathlib import Path
 import tempfile
 import unittest
@@ -85,6 +87,26 @@ class ParserTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.get_story_image("http://127.0.0.1/private", "")
         self.assertEqual(server.allowed_image_url("https://other.test/image.jpg", "https://www.gematsu.com/story"), "")
+
+    @patch("server.subprocess.run")
+    @patch("server.shutil.which", return_value="/usr/bin/curl")
+    @patch("server.request_bytes", side_effect=ssl.SSLCertVerificationError("certificate verify failed"))
+    def test_os_transport_recovers_python_tls_failure_without_disabling_tls(self, request, which, run):
+        png = b"\x89PNG\r\n\x1a\nimage-data"
+        def curl_result(command, **kwargs):
+            self.assertNotIn("--insecure", command)
+            self.assertNotIn("-k", command)
+            Path(command[command.index("--output") + 1]).write_bytes(png)
+            return subprocess.CompletedProcess(command, 0, b"200\nimage/png", b"")
+        run.side_effect = curl_result
+        data, kind = server.request_image_transport("https://www.gematsu.com/image.png", accept=server.IMAGE_ACCEPT)
+        self.assertEqual((data, kind), (png, "image/png"))
+
+    @patch("server.shutil.which", return_value=None)
+    @patch("server.request_bytes", side_effect=server.HTTPError("https://www.gematsu.com/image.jpg", 403, "Forbidden", {}, None))
+    def test_publisher_denial_retains_exact_status_when_no_os_transport(self, request, which):
+        with self.assertRaisesRegex(server.ImageFetchError, "HTTP 403 from www.gematsu.com"):
+            server.request_image_transport("https://www.gematsu.com/image.jpg", accept=server.IMAGE_ACCEPT)
 
     @patch("server.request_bytes")
     def test_crawler_follows_pages_until_known_item(self, request):
