@@ -8,6 +8,7 @@ import hashlib
 import json
 import re
 import threading
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -19,11 +20,16 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parent
 MAX_PAGES = 50
 SOURCES = {
-    "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query"},
-    "GI": {"name": "Game Informer", "url": "https://gameinformer.com/news", "page": "zero_query"},
-    "PS": {"name": "Push Square", "url": "https://www.pushsquare.com/news", "page": "query"},
-    "GE": {"name": "Gematsu", "url": "https://www.gematsu.com/browse", "page": "path"},
-    "VGC": {"name": "VGC", "url": "https://www.videogameschronicle.com/category/news/", "page": "path"},
+    "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query",
+           "feed": "https://www.gamespot.com/feeds/news/"},
+    "GI": {"name": "Game Informer", "url": "https://gameinformer.com/news", "page": "zero_query",
+           "feed": "https://gameinformer.com/rss.xml"},
+    "PS": {"name": "Push Square", "url": "https://www.pushsquare.com/news", "page": "query",
+           "feed": "https://www.pushsquare.com/feeds/news"},
+    "GE": {"name": "Gematsu", "url": "https://www.gematsu.com/browse", "page": "path",
+           "feed": "https://www.gematsu.com/feed"},
+    "VGC": {"name": "VGC", "url": "https://www.videogameschronicle.com/category/news/", "page": "path",
+            "feed": "https://www.videogameschronicle.com/category/news/feed/"},
 }
 SOURCE_HOSTS = {urlsplit(source["url"]).hostname for source in SOURCES.values()}
 IMAGE_URLS: dict[str, tuple[str, str]] = {}
@@ -56,6 +62,19 @@ def request_bytes(url: str, *, accept: str, referer: str = "", limit: int = 8 * 
     if len(data) > limit:
         raise ValueError("Response too large")
     return data, content_type
+
+
+def image_content_type(data: bytes, reported: str) -> str:
+    if reported.startswith("image/"):
+        return reported
+    signatures = ((b"\xff\xd8\xff", "image/jpeg"), (b"\x89PNG\r\n\x1a\n", "image/png"),
+                  (b"GIF87a", "image/gif"), (b"GIF89a", "image/gif"), (b"RIFF", "image/webp"))
+    for signature, content_type in signatures:
+        if data.startswith(signature):
+            return content_type
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return ""
 
 
 class NewsHTMLParser(HTMLParser):
@@ -120,7 +139,7 @@ class NewsHTMLParser(HTMLParser):
                 self.items.append({"url": anchor["url"], "id": anchor["url"], "title": title,
                                    "image": anchor["image"] or self._article_image,
                                    "published": anchor["published"] or self._article_date})
-            if anchor["url"] and re.search(r"\b(next|older|more|بعدی)\b", title, re.I):
+            if anchor["url"] and re.search(r"\b(next|older|more)\b", title, re.I):
                 self.next_url = anchor["url"]
         elif tag in ("h1", "h2", "h3", "h4"):
             self._heading = max(0, self._heading - 1)
@@ -173,6 +192,52 @@ def parse_news_page(data: bytes, base: str) -> tuple[list[dict], str]:
     return list(unique.values()), parser.next_url
 
 
+def parse_feed(data: bytes, base: str) -> list[dict]:
+    """Read RSS/Atom while preserving the publisher's exact title text."""
+    root = ET.fromstring(data)
+    local = lambda tag: tag.rsplit("}", 1)[-1]
+    entries = [node for node in root.iter() if local(node.tag) in ("item", "entry")]
+    result = []
+    seen = set()
+    for entry in entries:
+        title = link = published = image = ""
+        for node in entry.iter():
+            tag = local(node.tag)
+            if tag == "title" and not title:
+                title = unescape("".join(node.itertext())).strip()
+            elif tag == "link" and not link and node.get("rel", "alternate") == "alternate":
+                link = node.get("href") or node.text or ""
+            elif tag in ("pubDate", "published", "updated") and not published:
+                published = (node.text or "").strip()
+            elif tag in ("thumbnail", "content", "enclosure"):
+                candidate = node.get("url") or node.get("href") or node.get("src") or ""
+                if candidate and (tag != "enclosure" or node.get("type", "").startswith("image/")):
+                    image = image or candidate
+            if tag in ("description", "encoded", "content") and node.text and not image:
+                # The small image parser below avoids treating article links as images.
+                match = re.search(r"<img[^>]+(?:src|data-src)=[\"']([^\"']+)", node.text, re.I)
+                if match:
+                    image = match.group(1)
+        link = safe_url(link, base, article=True)
+        if title and link and link not in seen:
+            seen.add(link)
+            result.append({"url": link, "id": link, "title": title,
+                           "image": safe_url(image, base) if image else "", "published": published})
+    if not result:
+        raise ValueError("No readable feed entries")
+    return result
+
+
+def fetch_feed(source: dict) -> list[dict]:
+    feed = source.get("feed")
+    if not feed:
+        return []
+    data, content_type = request_bytes(feed, accept="application/rss+xml,application/atom+xml,application/xml,text/xml,*/*;q=0.5")
+    if content_type not in ("application/rss+xml", "application/atom+xml", "application/xml", "text/xml", "text/plain"):
+        raise ValueError("Unexpected feed response")
+    return parse_feed(data, source["url"])
+
+
 def fallback_page_url(source: dict, page: int) -> str:
     base = source["url"]
     if source["page"] == "path":
@@ -185,6 +250,11 @@ def fallback_page_url(source: dict, page: int) -> str:
 
 def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
     source = SOURCES[code]
+    try:
+        feed_items = fetch_feed(source)
+    except Exception:
+        feed_items = []
+    feed_by_id = {item["id"]: item for item in feed_items}
     current = source["url"]
     visited_pages = set()
     collected = []
@@ -201,14 +271,17 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
             items, next_url = parse_news_page(data, current)
         except Exception as exc:
             if page == 1:
-                return code, {"items": [], "error": f"دریافت اخبار {source['name']} ممکن نشد: {type(exc).__name__}",
+                if feed_items:
+                    return code, {"items": feed_items, "error": None, "complete": True}
+                return code, {"items": [], "error": f"Could not fetch {source['name']} news ({type(exc).__name__}).",
                               "complete": False}
-            return code, {"items": collected, "error": f"صفحه {page} از {source['name']} دریافت نشد؛ سابقه جلو نرفت.",
+            return code, {"items": collected, "error": f"Page {page} of {source['name']} failed; its checkpoint was not advanced.",
                           "complete": False}
         if not items:
             if page == 1:
-                return code, {"items": [], "error": f"ساختار صفحه {source['name']} قابل خواندن نبود.",
-                              "complete": False}
+                if feed_items:
+                    return code, {"items": feed_items, "error": None, "complete": True}
+                return code, {"items": [], "error": f"Could not read the {source['name']} news page.", "complete": False}
             break
         page_ids = {item["id"] for item in items}
         reached_known = bool(page_ids & known_ids)
@@ -217,7 +290,7 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
                 continue
             if item["id"] not in collected_ids:
                 collected_ids.add(item["id"])
-                collected.append(item)
+                collected.append(feed_by_id.get(item["id"], item))
         if reached_known or not known_ids:
             break
         candidate = next_url or fallback_page_url(source, page + 1)
@@ -225,7 +298,10 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
         if not current:
             break
     complete = reached_known or not known_ids
-    error = None if complete else f"پس از {MAX_PAGES} صفحه هنوز به آخرین خبر ذخیره‌شدهٔ {source['name']} نرسیدیم؛ دوباره بررسی کن."
+    # RSS is also used to add posts omitted by a dynamically rendered listing.
+    existing = {item["id"] for item in collected}
+    collected[:0] = [item for item in feed_items if item["id"] not in existing]
+    error = None if complete else f"The crawler did not reach the last saved {source['name']} item after {MAX_PAGES} pages."
     return code, {"items": collected, "error": error, "complete": complete}
 
 
@@ -289,7 +365,7 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 data, reported = request_bytes(image[0], accept="image/avif,image/webp,image/*,*/*;q=0.8",
                                                referer=image[1], limit=10 * 1024 * 1024, timeout=15)
-                image_type = reported if reported.startswith("image/") else ""
+                image_type = image_content_type(data, reported)
                 if not image_type:
                     raise ValueError("Not an image")
             except Exception:

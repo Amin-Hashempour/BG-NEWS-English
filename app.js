@@ -24,7 +24,7 @@ function message(text, error = false) {
 }
 function persist() {
   try { localStorage.setItem(STORAGE, JSON.stringify(state)); }
-  catch { message('ذخیره‌سازی مرورگر در دسترس نیست؛ سابقه بعد از بستن صفحه باقی نمی‌ماند.', true); }
+  catch { message('Browser storage is unavailable. Your list will not persist after closing this page.', true); }
 }
 function render() {
   const selected = state.items.filter(item => filter === 'all' || item.source === filter);
@@ -43,14 +43,14 @@ function render() {
     const meta = document.createElement('div'); meta.className = 'card-meta';
     const source = document.createElement('span'); source.textContent = names[item.source];
     const time = document.createElement('time'); const date = new Date(item.published);
-    if (!Number.isNaN(date.getTime())) { time.dateTime = date.toISOString(); time.textContent = new Intl.DateTimeFormat('fa-IR', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(date); }
+    if (!Number.isNaN(date.getTime())) { time.dateTime = date.toISOString(); time.textContent = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(date); }
     const title = document.createElement('h2'); title.textContent = item.title;
     title.lang = 'en'; title.dir = 'ltr'; title.style.textAlign = 'left'; title.style.lineHeight = '1.65';
     meta.append(source, time); copy.append(meta, title); link.append(imageWrap, copy); card.append(mark, link); $('articles').append(card);
   }
-  $('total').textContent = state.items.length.toLocaleString('fa-IR');
+  $('total').textContent = state.items.length.toLocaleString('en-US');
   $('empty').hidden = selected.length > 0;
-  if (state.lastUpdate) $('update-time').textContent = 'آخرین بررسی: ' + new Date(state.lastUpdate).toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' });
+  if (state.lastUpdate) $('update-time').textContent = 'Last checked: ' + new Date(state.lastUpdate).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
 
 function mergeSource(current, code, incoming, complete = true) {
@@ -69,7 +69,7 @@ function mergeSource(current, code, incoming, complete = true) {
 }
 
 async function refresh() {
-  const button = $('refresh'); button.disabled = true; button.setAttribute('aria-busy', 'true'); $('refresh-label').textContent = 'در حال بررسی…'; $('messages').replaceChildren();
+  const button = $('refresh'); button.disabled = true; button.setAttribute('aria-busy', 'true'); $('refresh-label').textContent = 'Checking…'; $('messages').replaceChildren();
   const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 120000);
   try {
     const known = Object.fromEntries(Object.keys(names).map(code => [code, state.sources[code]?.seen || []]));
@@ -78,7 +78,7 @@ async function refresh() {
     const result = await response.json(); let added = 0; let success = 0;
     for (const code of Object.keys(names)) {
       const source = result[code];
-      if (!source || !Array.isArray(source.items)) { message(`پاسخی از ${names[code]} دریافت نشد.`, true); continue; }
+      if (!source || !Array.isArray(source.items)) { message(`No response was received from ${names[code]}.`, true); continue; }
       const items = source.items.filter(item => item && typeof item.id === 'string' && typeof item.title === 'string' && httpURL(item.url));
       if (source.error) message(source.error, true);
       if (source.complete) { added += mergeSource(state, code, items, true); success++; }
@@ -86,11 +86,11 @@ async function refresh() {
     if (success) {
       state.items.sort((a, b) => (Date.parse(b.published) || 0) - (Date.parse(a.published) || 0));
       state.lastUpdate = new Date().toISOString(); persist(); render();
-      message(added ? `${added.toLocaleString('fa-IR')} خبر تازه اضافه شد.` : 'همه منابع بررسی شدند؛ خبر تازه‌ای نبود.');
+      message(added ? `${added.toLocaleString('en-US')} new stories added.` : 'All sources checked. No new stories were found.');
     }
   } catch (error) {
-    message(error.name === 'AbortError' ? 'بررسی منابع بیش از دو دقیقه طول کشید؛ دوباره امتحان کن.' : 'ارتباط با سرور محلی برقرار نشد.', true);
-  } finally { clearTimeout(timeout); button.disabled = false; button.removeAttribute('aria-busy'); $('refresh-label').textContent = 'تازه‌ها رو بگیر'; }
+    message(error.name === 'AbortError' ? 'Checking the sources took more than two minutes. Please try again.' : 'Could not connect to the local server.', true);
+  } finally { clearTimeout(timeout); button.disabled = false; button.removeAttribute('aria-busy'); $('refresh-label').textContent = 'Get latest news'; }
 }
 
 document.querySelectorAll('.filter').forEach(button => button.addEventListener('click', () => {
@@ -100,4 +100,4 @@ document.querySelectorAll('.filter').forEach(button => button.addEventListener('
 }));
 $('refresh').addEventListener('click', refresh);
 render();
-if (location.protocol === 'file:') message('ابتدا python3 server.py را اجرا کن و صفحه را از http://127.0.0.1:8766 باز کن.', true);
+if (location.protocol === 'file:') message('Run python3 server.py, then open http://127.0.0.1:8766 in your browser.', true);

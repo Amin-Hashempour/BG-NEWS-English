@@ -9,6 +9,12 @@ PAGE = b'''<!doctype html><html><head>
 <script type="application/ld+json">{"@type":"NewsArticle","headline":"Sony reveals PS5 update","url":"https://example.org/story-one","image":"/one.jpg","datePublished":"2026-10-24T08:00:00Z"}</script>
 </head><body><article><a href="/story-two"><img data-src="/two.jpg"><h2>Second gaming story appears today</h2></a><time datetime="2026-10-23T10:00:00Z"></time></article></body></html>'''
 
+RSS = b'''<rss xmlns:media="http://search.yahoo.com/mrss/"><channel><item>
+<title>Exact Publisher Title &amp; Punctuation</title><link>https://example.org/news/exact</link>
+<pubDate>Fri, 23 Oct 2026 15:26:11 +0000</pubDate>
+<media:content url="https://cdn.example.org/image.webp" type="image/webp" />
+</item></channel></rss>'''
+
 
 class ParserTests(unittest.TestCase):
     def test_structured_data_cards_and_next_page(self):
@@ -25,6 +31,15 @@ class ParserTests(unittest.TestCase):
     def test_source_page_patterns(self):
         self.assertEqual(server.fallback_page_url(server.SOURCES["GI"], 2), "https://gameinformer.com/news?page=1")
         self.assertEqual(server.fallback_page_url(server.SOURCES["GE"], 3), "https://www.gematsu.com/browse/page/3/")
+
+    def test_feed_preserves_exact_title_date_and_image(self):
+        item = server.parse_feed(RSS, "https://example.org/news")[0]
+        self.assertEqual(item["title"], "Exact Publisher Title & Punctuation")
+        self.assertEqual(item["published"], "Fri, 23 Oct 2026 15:26:11 +0000")
+        self.assertEqual(item["image"], "https://cdn.example.org/image.webp")
+
+    def test_image_signature_fallback(self):
+        self.assertEqual(server.image_content_type(b"RIFF1234WEBP", "application/octet-stream"), "image/webp")
 
     @patch("server.request_bytes")
     def test_crawler_follows_pages_until_known_item(self, request):

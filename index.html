@@ -2,20 +2,20 @@
 <html lang="en" dir="ltr">
 <head>
   <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#101015"><title>نقطه — تازه‌های بازی</title>
+  <meta name="theme-color" content="#101015"><title>Checkpoint — Gaming News</title>
   <link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="fonts.css"><link rel="stylesheet" href="styles.css"><link rel="stylesheet" href="layout-ltr.css"><script src="app.js" defer></script>
 </head>
 <body>
 <div class="shell"><main>
-  <header><span class="eyebrow">GLOBAL GAMING NEWS</span><h1>نقطه<span>.</span></h1><p>خبرهای مهم بازی، یک‌جا و با عنوان اصلی منبع</p></header>
-  <section class="toolbar" aria-label="فیلتر منابع">
-    <div class="filters"><button class="filter active" data-filter="all" aria-pressed="true">همه <span id="total">۰</span></button><button class="filter" data-filter="GS" aria-pressed="false">GameSpot</button><button class="filter" data-filter="GI" aria-pressed="false">Game Informer</button><button class="filter" data-filter="PS" aria-pressed="false">Push Square</button><button class="filter" data-filter="GE" aria-pressed="false">Gematsu</button><button class="filter" data-filter="VGC" aria-pressed="false">VGC</button></div>
-    <span class="update-time" id="update-time">هنوز به‌روزرسانی نشده</span>
+  <header><span class="eyebrow">GLOBAL GAMING NEWS</span><h1>Checkpoint<span>.</span></h1><p>The latest gaming stories, collected in one quiet place.</p></header>
+  <section class="toolbar" aria-label="Filter news sources">
+    <div class="filters"><button class="filter active" data-filter="all" aria-pressed="true">All <span id="total">0</span></button><button class="filter" data-filter="GS" aria-pressed="false">GameSpot</button><button class="filter" data-filter="GI" aria-pressed="false">Game Informer</button><button class="filter" data-filter="PS" aria-pressed="false">Push Square</button><button class="filter" data-filter="GE" aria-pressed="false">Gematsu</button><button class="filter" data-filter="VGC" aria-pressed="false">VGC</button></div>
+    <span class="update-time" id="update-time">Not updated yet</span>
   </section>
   <div id="messages" role="status" aria-live="polite"></div>
-  <section id="articles" class="articles" aria-label="خبرها"></section>
-  <section id="empty" class="empty"><div class="empty-art"><span class="orbit"></span><span class="orbit orbit-two"></span><span class="empty-symbol">↻</span></div><h2>تازه‌ترین خبرها منتظرند</h2><p>دکمه بنفش را بزن تا خبرهای هر پنج رسانه با عنوان اصلی‌شان جمع‌آوری شوند.</p><span class="empty-caption">پنج رسانه. یک فهرست خلوت.</span></section>
+  <section id="articles" class="articles" aria-label="News stories"></section>
+  <section id="empty" class="empty"><div class="empty-art"><span class="orbit"></span><span class="orbit orbit-two"></span><span class="empty-symbol">↻</span></div><h2>Your news feed is ready</h2><p>Use the purple button to collect the latest stories from all five sources.</p><span class="empty-caption">Five sources. One focused feed.</span></section>
   <footer><span>GAMESPOT · GAME INFORMER · PUSH SQUARE · GEMATSU · VGC</span></footer>
 </main></div>
-<div class="refresh-wrap"><span id="refresh-label">تازه‌ها رو بگیر</span><button id="refresh" aria-label="دریافت خبرهای جدید"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg></button></div>
+<div class="refresh-wrap"><span id="refresh-label">Get latest news</span><button id="refresh" aria-label="Get latest news"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M6.1 7a7 7 0 0 1 11.5-1L20 9M4 15l2.4 3A7 7 0 0 0 17.9 17"/></svg></button></div>
 </body></html>
