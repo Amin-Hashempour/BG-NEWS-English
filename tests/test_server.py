@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import server
 
@@ -78,8 +78,44 @@ class ParserTests(unittest.TestCase):
         request.side_effect = respond
         with tempfile.TemporaryDirectory() as directory, patch.object(server, "IMAGE_FILES", Path(directory)):
             self.assertEqual(server.get_story_image(article, cdn), (png, "image/png"))
-        self.assertEqual(request.call_count, 1)
+        self.assertEqual(request.call_count, 3)
         self.assertEqual(request.call_args.args[0], first_party)
+
+    @patch("server.request_image_transport")
+    def test_push_square_retries_cdn_when_main_domain_is_forbidden(self, request):
+        article = "https://www.pushsquare.com/news/2026/10/story"
+        first_party = "https://www.pushsquare.com/images/6976f1890c71d/small.jpg"
+        cdn = "https://images.pushsquare.com/6976f1890c71d/small.jpg"
+        png = b"\x89PNG\r\n\x1a\nreal-image-data"
+        def respond(url, **kwargs):
+            if url == first_party:
+                raise server.HTTPError(url, 403, "Forbidden", {}, None)
+            self.assertEqual(url, cdn)
+            return png, "image/png"
+        request.side_effect = respond
+        with tempfile.TemporaryDirectory() as directory, patch.object(server, "IMAGE_FILES", Path(directory)):
+            self.assertEqual(server.get_story_image(article, first_party), (png, "image/png"))
+        self.assertEqual(request.call_args.args[0], cdn)
+
+    @patch("server.request_standard_image_transport", side_effect=server.ImageFetchError("HTTP 403"))
+    @patch("server.request_browser_image", return_value=(b"image", "image/jpeg"))
+    @patch("server.browser_requests", new=object())
+    def test_push_square_uses_browser_https_without_rewriting_original_url(self, browser, standard):
+        url = "https://images.pushsquare.com/6976f1890c71d/small.jpg"
+        self.assertEqual(server.request_image_transport(url, accept=server.IMAGE_ACCEPT), (b"image", "image/jpeg"))
+        self.assertEqual(browser.call_args.args[0], url)
+        standard.assert_not_called()
+
+    @patch("server.BROWSER_SESSIONS", new_callable=server.threading.local)
+    @patch("server.browser_requests")
+    def test_browser_https_keeps_verification_and_limits_response_size(self, browser_requests, sessions):
+        response = MagicMock(status_code=200, headers={"Content-Type": "image/jpeg"})
+        response.iter_content.return_value = iter([b"too", b"large"])
+        browser_requests.Session.return_value.get.return_value = response
+        with self.assertRaisesRegex(server.ImageFetchError, "size limit"):
+            server.request_browser_image("https://images.pushsquare.com/a/small.jpg", accept=server.IMAGE_ACCEPT, limit=4)
+        browser_requests.Session.assert_called_once_with(impersonate="chrome", verify=True)
+        response.close.assert_called_once()
 
     @patch("server.request_image_transport")
     def test_story_cache_is_reused_if_thumbnail_hint_changes(self, request):

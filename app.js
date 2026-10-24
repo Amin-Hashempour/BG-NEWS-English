@@ -15,15 +15,23 @@ function httpURL(value) {
   catch { return ''; }
 }
 function originalImageURL(item) {
-  const original = httpURL(item.originalImage) || httpURL(item.image);
-  if (!original) return '';
-  const url = new URL(original);
-  // Push Square serves the same bytes through its first-party image endpoint.
-  // This also repairs saved stories whose CDN host is denied by the publisher.
-  if (item.source === 'PS' && url.hostname === 'images.pushsquare.com' && /^\/[a-f0-9]+\//i.test(url.pathname)) {
-    return 'https://www.pushsquare.com/images' + url.pathname + url.search;
+  return httpURL(item.originalImage) || httpURL(item.image);
+}
+function directImageURLs(item) {
+  const urls = new Set([originalImageURL(item), ...(Array.isArray(item.imageAlternates) ? item.imageAlternates.map(httpURL) : [])].filter(Boolean));
+  // Keep BOTH publisher routes, including for saved history from v1.3.2.
+  // Rewriting every URL to the main domain removed a working CDN fallback.
+  if (item.source === 'PS') {
+    for (const value of [...urls]) {
+      const url = new URL(value);
+      if (url.hostname === 'images.pushsquare.com' && /^\/[a-f0-9]+\//i.test(url.pathname)) {
+        urls.add('https://www.pushsquare.com/images' + url.pathname + url.search);
+      } else if (['www.pushsquare.com', 'pushsquare.com'].includes(url.hostname) && /^\/images\/[a-f0-9]+\//i.test(url.pathname)) {
+        urls.add('https://images.pushsquare.com' + url.pathname.slice('/images'.length) + url.search);
+      }
+    }
   }
-  return original;
+  return [...urls];
 }
 function storyImageURL(item) {
   const article = httpURL(item.url);
@@ -52,7 +60,7 @@ function render() {
     const imageWrap = document.createElement('div'); imageWrap.className = 'image-wrap';
     // Reconstruct the local URL from the article, including for legacy history
     // whose RAM tokens or original image fields are missing or incorrect.
-    const candidates = [...new Set([storyImageURL(item), originalImageURL(item)].filter(Boolean))];
+    const candidates = [...new Set([storyImageURL(item), ...directImageURLs(item)].filter(Boolean))];
     const image = document.createElement('img'); image.alt = ''; image.loading = 'lazy'; image.referrerPolicy = 'no-referrer';
     let candidate = 0;
     let failureDetail = '';
@@ -156,5 +164,6 @@ $('refresh').addEventListener('click', refresh);
 render();
 if (location.protocol === 'file:') message('Run python3 server.py, then open http://127.0.0.1:8766 in your browser.', true);
 else fetch('/api/health', { cache: 'no-store' }).then(response => response.json()).then(health => {
-  if (health.version !== '1.3.2') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
+  if (health.version !== '1.3.3') message('An older server is still running. Stop it with Ctrl+C, then run server.py from this version of the project.', true);
+  else if (!health.browser_https) message('Enable Push Square image support: stop the server, run python -m pip install -r requirements.txt, then start it again.', true);
 }).catch(() => message('The local server is unavailable. Run python3 server.py from this project folder.', true));

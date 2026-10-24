@@ -1,5 +1,5 @@
 // Optional live browser regression: requires Playwright and Chromium for development.
-// Application users still need only Python. Run: node tests/test_images.cjs
+// Application users need Python and requirements.txt. Run: node tests/test_images.cjs
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const { once } = require('node:events');
@@ -12,7 +12,7 @@ const { chromium } = require('playwright');
 const root = path.resolve(__dirname, '..');
 let server;
 let browser;
-const transportCache = process.env.BGNEWS_FORCE_CURL || process.env.BGNEWS_DENY_PUSH_CDN ? fs.mkdtempSync(path.join(os.tmpdir(), 'bgnews-image-test-')) : '';
+const transportCache = ['BGNEWS_FORCE_CURL', 'BGNEWS_DENY_PUSH_CDN', 'BGNEWS_DENY_PUSH_ORIGIN', 'BGNEWS_FORCE_BROWSER'].some(name => process.env[name]) ? fs.mkdtempSync(path.join(os.tmpdir(), 'bgnews-image-test-')) : '';
 
 async function startServer(port) {
   const forcedTransport = `
@@ -24,10 +24,20 @@ def fail_python_images(url, **kwargs):
         raise ssl.SSLCertVerificationError('Simulated Python-only TLS failure')
     return original(url, **kwargs)
 server.request_bytes = fail_python_images
+original_standard_transport = server.request_standard_image_transport
+def denied_standard_transport(url, **kwargs):
+    if ${process.env.BGNEWS_FORCE_BROWSER ? 'True' : 'False'} and (server.urlsplit(url).hostname or '').endswith('pushsquare.com'):
+        raise server.ImageFetchError('HTTP 403 from both standard HTTPS transports')
+    return original_standard_transport(url, **kwargs)
+server.request_standard_image_transport = denied_standard_transport
+if ${process.env.BGNEWS_FORCE_BROWSER ? 'True' : 'False'}:
+    assert server.browser_requests is not None, 'Install requirements.txt for browser HTTPS testing'
 original_image_transport = server.request_image_transport
 def denied_cdn(url, **kwargs):
     if ${process.env.BGNEWS_DENY_PUSH_CDN ? 'True' : 'False'} and server.urlsplit(url).hostname == 'images.pushsquare.com':
         raise server.HTTPError(url, 403, 'Simulated publisher CDN denial', {}, None)
+    if ${process.env.BGNEWS_DENY_PUSH_ORIGIN ? 'True' : 'False'} and server.urlsplit(url).hostname == 'www.pushsquare.com' and server.urlsplit(url).path.startswith('/images/'):
+        raise server.HTTPError(url, 403, 'Simulated main-domain image denial', {}, None)
     return original_image_transport(url, **kwargs)
 server.request_image_transport = denied_cdn
 server.IMAGE_FILES = Path(${JSON.stringify(transportCache)})
@@ -99,6 +109,7 @@ async function checkImages(page, phase, expected) {
   // our server downloaded the publisher image and the browser decoded its bytes.
   await page.route(/^https:\/\//, route => route.abort());
   await page.goto(base);
+  assert.equal(await page.locator('#refresh').evaluate(node => getComputedStyle(node).backgroundColor), 'rgb(189, 121, 90)', 'The theme must use muted terracotta');
   const news = page.waitForResponse(response => response.url() === base + '/api/news');
   await page.locator('#refresh').click();
   const payload = await (await news).json();

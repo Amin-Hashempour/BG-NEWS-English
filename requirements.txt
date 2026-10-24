@@ -1,0 +1,2 @@
+# Browser-compatible TLS/HTTP for publisher image servers that reject stdlib curl.
+curl_cffi==0.16.3

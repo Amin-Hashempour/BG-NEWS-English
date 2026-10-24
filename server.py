@@ -22,6 +22,11 @@ from urllib.parse import parse_qs, parse_qsl, urlencode, urljoin, urlsplit, urlu
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
+try:
+    from curl_cffi import requests as browser_requests
+except ImportError:
+    browser_requests = None
+
 ROOT = Path(__file__).resolve().parent
 IMAGE_CACHE_FILE = ROOT / ".image-urls.json"
 IMAGE_FILES = ROOT / ".image-cache"
@@ -29,6 +34,7 @@ IMAGE_FETCH_LOCKS = [threading.Lock() for _ in range(64)]
 IMAGE_DOWNLOADS = threading.BoundedSemaphore(6)
 IMAGE_ACCEPT = "image/jpeg,image/png,image/webp,image/*;q=0.8"
 IMAGE_ERRORS: dict[str, dict] = {}
+BROWSER_SESSIONS = threading.local()
 MAX_PAGES = 50
 SOURCES = {
     "GS": {"name": "GameSpot", "url": "https://www.gamespot.com/category/news/", "page": "query",
@@ -112,7 +118,7 @@ class ImageFetchError(Exception):
         self.candidates = list(candidates)
 
 
-def request_image_transport(url: str, *, accept: str, referer: str = "",
+def request_standard_image_transport(url: str, *, accept: str, referer: str = "",
                             limit: int = 10 * 1024 * 1024, timeout: int = 12):
     """Use OS curl when Python's HTTPS stack fails. TLS checks stay enabled."""
     try:
@@ -150,6 +156,54 @@ def request_image_transport(url: str, *, accept: str, referer: str = "",
                 return data, (metadata[1].split(";", 1)[0] if len(metadata) > 1 else "application/octet-stream")
             except subprocess.TimeoutExpired as exc:
                 raise ImageFetchError(f"Connection to {urlsplit(url).hostname} timed out in both transports") from exc
+
+
+def request_browser_image(url: str, *, accept: str, referer: str = "",
+                          limit: int = 10 * 1024 * 1024, timeout: int = 12):
+    if browser_requests is None:
+        raise ImageFetchError("Install browser HTTPS support: python -m pip install -r requirements.txt")
+    session = getattr(BROWSER_SESSIONS, "session", None)
+    if session is None:
+        # Session preserves cookies and uses Chrome's TLS/HTTP profile. It keeps
+        # certificate verification and the user's configured CA bundle enabled.
+        session = browser_requests.Session(impersonate="chrome", verify=True)
+        BROWSER_SESSIONS.session = session
+    headers = {"Accept": accept, "Accept-Language": "en-US,en;q=0.9"}
+    if referer:
+        headers["Referer"] = referer
+    response = session.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
+    try:
+        if not 200 <= response.status_code < 300:
+            raise ImageFetchError(f"Browser HTTPS: HTTP {response.status_code} from {urlsplit(url).hostname}")
+        chunks = []
+        size = 0
+        for chunk in response.iter_content():
+            size += len(chunk)
+            if size > limit:
+                raise ImageFetchError("Publisher response exceeded the image size limit")
+            chunks.append(chunk)
+        return b"".join(chunks), response.headers.get("Content-Type", "application/octet-stream").split(";", 1)[0]
+    finally:
+        response.close()
+
+
+def request_image_transport(url: str, *, accept: str, referer: str = "",
+                            limit: int = 10 * 1024 * 1024, timeout: int = 12):
+    is_push_square = (urlsplit(url).hostname or "").removeprefix("www.") in ("pushsquare.com", "images.pushsquare.com")
+    options = {"accept": accept, "referer": referer, "limit": limit, "timeout": timeout}
+    browser_error = None
+    if is_push_square and browser_requests is not None:
+        try:
+            return request_browser_image(url, **options)
+        except Exception as exc:
+            browser_error = failure_description(exc, url)
+    try:
+        return request_standard_image_transport(url, **options)
+    except Exception as exc:
+        detail = failure_description(exc, url)
+        if is_push_square:
+            detail += "; " + (browser_error or "Browser HTTPS support missing: run python -m pip install -r requirements.txt")
+        raise ImageFetchError(detail) from exc
 
 
 def image_content_type(data: bytes, reported: str) -> str:
@@ -439,10 +493,8 @@ def crawl_source(code: str, known_ids: set[str]) -> tuple[str, dict]:
 def add_image_proxies(items: list[dict]) -> list[dict]:
     for item in items:
         original = item.get("originalImage") or item.get("image", "")
-        choices = publisher_image_urls(original, item["url"])
-        if choices:
-            original = choices[0]
         item["originalImage"] = original
+        item["imageAlternates"] = publisher_image_urls(original, item["url"])
         # Each URL carries its own recovery information; no RAM token or JSON
         # mapping is needed, even for old browser history on a fresh installation.
         item["image"] = "/api/story-image?" + urlencode({"article": item["url"], "image": original})
@@ -489,7 +541,10 @@ def publisher_image_urls(value: str, article: str) -> list[str]:
         # Verified against the CDN: same image bytes, served by the publisher's
         # main domain without redirecting back to the denied CDN hostname.
         first_party = urlunsplit(("https", "www.pushsquare.com", "/images" + parts.path, parts.query, ""))
-        return [first_party, url]
+        return [url, first_party]
+    if parts.hostname in ("www.pushsquare.com", "pushsquare.com") and re.match(r"^/images/[a-f0-9]+/", parts.path, re.I):
+        cdn = urlunsplit(("https", "images.pushsquare.com", parts.path[len("/images"):], parts.query, ""))
+        return [url, cdn]
     return [url]
 
 
@@ -639,7 +694,7 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self):
         path = urlsplit(self.path).path
         if path == "/api/health":
-            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.2"})
+            self.json_response({"ok": True, "sources": len(SOURCES), "version": "1.3.3", "browser_https": browser_requests is not None})
         elif path == "/api/image-status":
             query = parse_qs(urlsplit(self.path).query)
             article = query.get("article", [""])[0]
@@ -670,7 +725,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"Checkpoint 1.3.2: http://127.0.0.1:{args.port}", flush=True)
+    print(f"Checkpoint 1.3.3: http://127.0.0.1:{args.port}", flush=True)
+    if browser_requests is None:
+        print("Push Square browser HTTPS support is not installed. Run: python -m pip install -r requirements.txt", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

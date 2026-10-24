@@ -1,5 +1,5 @@
 html,body{direction:ltr}
-.retry-image{border:1px solid #655077;border-radius:8px;background:#262033;color:#d1bcff;padding:6px 12px;font-size:11px}
+.retry-image{border:1px solid #74533e;border-radius:8px;background:var(--accent-dark);color:var(--accent-light);padding:6px 12px;font-size:11px}
 header,.toolbar,.notice,.empty{text-align:left}
 .story-link{grid-template-columns:190px minmax(0,1fr);grid-template-areas:"image copy";direction:ltr}
 .story-copy{direction:ltr;text-align:left}
